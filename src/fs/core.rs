@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    Request,
+    ReplyOpen, Request,
 };
+
+use fuser::consts::FOPEN_DIRECT_IO;
 use libc::ENOENT;
 use reqwest::{
     self,
@@ -17,6 +19,11 @@ use crate::qbt::core::Client;
 use crate::qbt::torrents::Item;
 use crate::qbt::torrents::Torrent;
 use log::{debug, error, info, warn};
+
+use std::result;
+
+use strum::IntoEnumIterator;
+use strum_macros::EnumIter;
 
 const TTL: Duration = Duration::from_secs(1);
 const BLOCK_SIZE: u32 = 512;
@@ -55,30 +62,40 @@ pub struct QFS<'a> {
     torrents: Vec<Torrent<'a>>,
 }
 
+#[derive(Debug, EnumIter, Copy, Clone, PartialEq, Eq)]
+enum FileEntry {
+    Metadata = 1,
+    ContentInfo,
+    Control,
+}
+
+impl Into<&'static str> for FileEntry {
+    fn into(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::ContentInfo => "content_info",
+            Self::Control => "control",
+        }
+    }
+}
+
+impl TryFrom<&str> for FileEntry {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "metadata" => Ok(Self::Metadata),
+            "content_info" => Ok(Self::ContentInfo),
+            "control" => Ok(Self::Control),
+            _ => Err(()),
+        }
+    }
+}
+
 impl<'a> QFS<'a> {
     pub fn reload(&mut self) -> Result<()> {
         self.client.get_torrent_list(&mut self.torrents);
         Ok(())
-    }
-
-    /// Get the inode of a node by path.
-    pub fn find(&self, path: &str) -> Option<&Inode> {
-        let path_components: Vec<&str> = path.split("/").collect();
-        let mut cwd = ROOT_INODE_NUMBER;
-
-        // The first path component will always be part of a torrent.
-        // Subsequent path members are "contents" of a torrent.
-
-        if path_components.len() == 1 {
-            // Search the torrents for the matching name.
-            let name = path_components.last();
-
-            for t in &self.torrents {
-                let content_path = &t.info.content_path;
-                println!("FIND: {:?} -> {:?}", path, content_path);
-            }
-        }
-        None
     }
 
     pub fn new(client: &'a Client) -> Result<Self> {
@@ -139,7 +156,7 @@ impl<'a> Filesystem for QFS<'a> {
         let now = SystemTime::now();
         let mut my_attr = FileAttr {
             ino: 0,
-            size: 0,
+            size: 10,
             blocks: 0,
             atime: now,
             mtime: now,
@@ -155,25 +172,22 @@ impl<'a> Filesystem for QFS<'a> {
             blksize: BLOCK_SIZE,
         };
 
-        let clean = name.to_str();
-        match clean {
-            Some("metadata") => {
-                let ino = ((parent + 1) as usize * INODE_OFFSET) + 1;
-                my_attr.ino = ino as u64;
-                reply.entry(&TTL, &my_attr, 0);
-            }
-            Some("control") => {
-                let ino = ((parent + 1) as usize * INODE_OFFSET) + 2;
-                my_attr.ino = ino as u64;
-                reply.entry(&TTL, &my_attr, 0);
-            }
-            Some(&_) => reply.error(ENOENT),
-            None => {
-                panic!("Invalid filename: {:?}", name)
-            }
-        }
+        let Some(name_str) = name.to_str() else {
+            reply.error(ENOENT);
+            return;
+        };
 
-        return;
+        let clean = match FileEntry::try_from(name_str) {
+            Ok(x) => x,
+            Err(_) => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        let ino = ((parent + 1) as usize * INODE_OFFSET) + (clean as usize);
+        my_attr.ino = ino as u64;
+        reply.entry(&TTL, &my_attr, 0);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
@@ -234,7 +248,8 @@ impl<'a> Filesystem for QFS<'a> {
         lock: Option<u64>,
         reply: ReplyData,
     ) {
-        todo!();
+        let buffer = "Foobarbaz\n".as_bytes();
+        reply.data(&buffer);
     }
 
     fn readdir(
@@ -302,14 +317,13 @@ impl<'a> Filesystem for QFS<'a> {
             return;
         }
 
-        // All torrents contain a few magic files.
-        const ENTRIES: &[&str] = &["metadata", "control"];
         let torrent = &self.torrents[torrents_index];
 
-        for (i, f) in ENTRIES.iter().enumerate().skip(offset as usize) {
+        for (i, f) in FileEntry::iter().enumerate().skip(offset as usize) {
+            let fname: &str = f.into();
             let ino = ino + 1;
             let idx = torrents_index + 1;
-            let full = reply.add(ino as u64, (i + 1) as i64, FileType::RegularFile, f);
+            let full = reply.add(ino as u64, (i + 1) as i64, FileType::RegularFile, fname);
             if (full) {
                 let name = &torrent.info.name;
                 warn!("Full on returning magic files for torrent {name}");
