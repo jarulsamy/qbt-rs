@@ -5,6 +5,7 @@ use qbt_rs::fs;
 use qbt_rs::qbt;
 use qbt_rs::shell::shell;
 
+use env_logger::Builder;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     Request,
@@ -92,6 +93,9 @@ fn fs_test() {
 }
 
 fn main() {
+    // Setup logging
+    Builder::new().filter_level(LevelFilter::Info).init();
+
     // qbt_test();
     // fs_test();
 

@@ -120,7 +120,7 @@ impl<'a> QFS<'a> {
 
 impl<'a> Filesystem for QFS<'a> {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        println!("LOOKUP  PARENT: {:?}  NAME: {:?}", parent, name);
+        info!("LOOKUP  PARENT: {:?}  NAME: {:?}", parent, name);
 
         if parent == ROOT_INODE_NUMBER {
             for (i, t) in self.torrents.iter().enumerate() {
@@ -263,7 +263,7 @@ impl<'a> Filesystem for QFS<'a> {
     ) {
         let torrents_index = (ino as usize / INODE_OFFSET) - 1;
         let rem = ino as usize % INODE_OFFSET;
-        println!(
+        info!(
             "============= INO: {:?} IDX: {:?} REM: {:?}",
             ino, torrents_index, rem
         );
@@ -336,7 +336,6 @@ impl<'a> Filesystem for QFS<'a> {
                 );
                 let full = false;
                 if full {
-                    println!("  BROKE: {:?}", self.torrents.len());
                     break;
                 }
             }
