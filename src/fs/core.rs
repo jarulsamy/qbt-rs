@@ -22,7 +22,7 @@ use log::{debug, error, info, warn};
 
 use std::result;
 
-use strum::IntoEnumIterator;
+use strum::{FromRepr, IntoEnumIterator};
 use strum_macros::EnumIter;
 
 const TTL: Duration = Duration::from_secs(1);
@@ -62,7 +62,8 @@ pub struct QFS<'a> {
     torrents: Vec<Torrent<'a>>,
 }
 
-#[derive(Debug, EnumIter, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, EnumIter, Copy, Clone, PartialEq, Eq, FromRepr)]
+#[repr(usize)]
 enum FileEntry {
     Metadata = 1,
     ContentInfo,
@@ -119,7 +120,7 @@ impl<'a> QFS<'a> {
 
 impl<'a> Filesystem for QFS<'a> {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        println!("LOOKUP\n  PARENT: {:?}\n  NAME: {:?}", parent, name);
+        println!("LOOKUP  PARENT: {:?}  NAME: {:?}", parent, name);
 
         if parent == ROOT_INODE_NUMBER {
             for (i, t) in self.torrents.iter().enumerate() {
@@ -153,10 +154,38 @@ impl<'a> Filesystem for QFS<'a> {
             return;
         }
 
+        let Some(name_str) = name.to_str() else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        let clean = match FileEntry::try_from(name_str) {
+            Ok(x) => x,
+            Err(_) => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
         let now = SystemTime::now();
+        let torrents_index = (parent as usize / INODE_OFFSET) - 1;
+        let ino = parent as usize + (clean as usize);
+        if torrents_index > self.torrents.len() {
+            // This should never happen, we're trying to query an inode that
+            // doesn't exist.
+            debug!(
+                "    torrents_index: {:?} / {:?}",
+                torrents_index,
+                self.torrents.len()
+            );
+            reply.error(ENOENT);
+            return;
+        }
+        let torrent = &mut self.torrents[torrents_index];
+
         let mut my_attr = FileAttr {
-            ino: 0,
-            size: 10,
+            ino: ino as u64,
+            size: torrent.get_metadata_len() as u64,
             blocks: 0,
             atime: now,
             mtime: now,
@@ -172,26 +201,10 @@ impl<'a> Filesystem for QFS<'a> {
             blksize: BLOCK_SIZE,
         };
 
-        let Some(name_str) = name.to_str() else {
-            reply.error(ENOENT);
-            return;
-        };
-
-        let clean = match FileEntry::try_from(name_str) {
-            Ok(x) => x,
-            Err(_) => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        let ino = ((parent + 1) as usize * INODE_OFFSET) + (clean as usize);
-        my_attr.ino = ino as u64;
         reply.entry(&TTL, &my_attr, 0);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        println!("GETATTR\n  INO: {:?}\n", ino);
         if ino == ROOT_INODE_NUMBER {
             const ROOT_ATTR: FileAttr = FileAttr {
                 ino: ROOT_INODE_NUMBER,
@@ -248,8 +261,32 @@ impl<'a> Filesystem for QFS<'a> {
         lock: Option<u64>,
         reply: ReplyData,
     ) {
-        let buffer = "Foobarbaz\n".as_bytes();
-        reply.data(&buffer);
+        let torrents_index = (ino as usize / INODE_OFFSET) - 1;
+        let rem = ino as usize % INODE_OFFSET;
+        println!(
+            "============= INO: {:?} IDX: {:?} REM: {:?}",
+            ino, torrents_index, rem
+        );
+        let special_file = match FileEntry::from_repr(rem) {
+            Some(FileEntry::Metadata) => {}
+            _ => return,
+        };
+
+        if torrents_index > self.torrents.len() {
+            // This should never happen, we're trying to query an inode that
+            // doesn't exist.
+            debug!(
+                "    torrents_index: {:?} / {:?}",
+                torrents_index,
+                self.torrents.len()
+            );
+            reply.error(ENOENT);
+            return;
+        }
+        let torrent = &mut self.torrents[torrents_index];
+
+        // let buffer = "Foobarbaz\n".as_bytes();
+        reply.data(torrent.get_metadata_bytes());
     }
 
     fn readdir(
@@ -309,14 +346,13 @@ impl<'a> Filesystem for QFS<'a> {
         }
 
         // Calculate the position within the torrents vector.
-        let torrents_index = (ino as usize) / INODE_OFFSET;
+        let torrents_index = ((ino - 1) as usize) / INODE_OFFSET;
         if torrents_index > self.torrents.len() {
             // This should never happen, we're trying to query an inode that
             // doesn't exist.
             reply.error(ENOENT);
             return;
         }
-
         let torrent = &self.torrents[torrents_index];
 
         for (i, f) in FileEntry::iter().enumerate().skip(offset as usize) {

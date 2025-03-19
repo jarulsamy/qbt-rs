@@ -1,4 +1,6 @@
 use anyhow::Result;
+use chrono::DateTime;
+use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::{str::Split, time::SystemTime};
@@ -261,6 +263,9 @@ pub struct Torrent<'a> {
     pub client: &'a Client,
     pub info: TorrentInfo,
     pub fetch_time: SystemTime,
+
+    /// Lazy computable raw buffer of metadata.
+    metadata_buffer: Option<Vec<u8>>,
 }
 
 impl<'a> Client {
@@ -284,8 +289,11 @@ impl<'a> Torrent<'a> {
             client,
             info,
             fetch_time: SystemTime::now(),
+            metadata_buffer: None,
         }
     }
+
+    /* Following are all part of the core QBT API */
 
     pub fn get_generic_properties(&self) -> Result<GenericInfo> {
         let endpoint = self.client.url("torrents/properties");
@@ -346,33 +354,117 @@ impl<'a> Torrent<'a> {
     }
 
     pub fn pause(&self) {
-        let query = [("hashes", &self.info.hash)];
+        let query = [("hash", &self.info.hash)];
         let endpoint = self.client.url("torrents/pause");
         todo!("Not implemented!");
     }
 
     pub fn resume(&self) {
-        let query = [("hashes", &self.info.hash)];
+        let query = [("hash", &self.info.hash)];
         let endpoint = self.client.url("torrents/resume");
         todo!("Not implemented!");
     }
 
     pub fn delete(&self) {
-        let query = [("hashes", &self.info.hash)];
+        let query = [("hash", &self.info.hash)];
         let endpoint = self.client.url("torrents/delete");
         todo!("Not implemented!");
     }
 
     pub fn recheck(&self) {
-        let query = [("hashes", &self.info.hash)];
+        let query = [("hash", &self.info.hash)];
         let endpoint = self.client.url("torrents/recheck");
         todo!("Not implemented!");
     }
 
     pub fn reannounce(&self) {
-        let query = [("hashes", &self.info.hash)];
+        let query = [("hash", &self.info.hash)];
         let endpoint = self.client.url("torrents/reannounce");
         todo!("Not implemented!");
+    }
+
+    /* Following are additional nice to have features not part of the core API. */
+
+    fn serialize_metadata(&mut self) {
+        // File Metadata format for a torrent //
+        // 0. name                          - str
+        // 1. added_on                      - RFC3339 datetime
+        // 2. availability                  - float
+        // 3. eta                           - int
+        // 4. dl_session downloaded         - int int
+        // 5. up_session uploaded           - int int
+        // 6. last_activity                 - RFC3339 datetime
+        // 7. size                          - int
+        // 8. progress                      - float
+        // 9. ratio                         - float
+        // 10. dl_speed                     - int
+        // 11. ul_speed                     - int
+
+        let generic_info = self.get_generic_properties().unwrap();
+
+        // let added_on = DateTime::<Local>::from(self.info.added_on);
+        let added_on = Local
+            .timestamp_opt(self.info.added_on, 0)
+            .unwrap()
+            .to_rfc3339();
+        let last_activity = Local
+            .timestamp_opt(self.info.last_activity, 0)
+            .unwrap()
+            .to_rfc3339();
+
+        let dl_line = [
+            self.info.downloaded_session.to_string(),
+            self.info.downloaded.to_string(),
+        ]
+        .join(" ");
+        let ul_line = [
+            self.info.uploaded_session.to_string(),
+            self.info.uploaded.to_string(),
+        ]
+        .join(" ");
+
+        let attrs = vec![
+            self.info.name.to_string(),
+            added_on, //
+            self.info.availability.to_string(),
+            self.info.eta.to_string(),
+            dl_line,
+            ul_line,
+            last_activity,
+            self.info.size.to_string(),
+            self.info.progress.to_string(),
+            self.info.ratio.to_string(),
+            generic_info.dl_speed.to_string(),
+            generic_info.up_speed.to_string(),
+        ];
+
+        let joined = attrs.join("\n") + "\n";
+        let joined_bytes = joined.as_bytes();
+        self.metadata_buffer = Some(joined_bytes.to_vec());
+    }
+
+    pub fn get_metadata_len(&mut self) -> usize {
+        match self.metadata_buffer {
+            None => self.serialize_metadata(),
+            Some(_) => (),
+        }
+
+        let buffer = match &self.metadata_buffer {
+            None => return 0,
+            Some(x) => return x.len(),
+        };
+    }
+
+    pub fn get_metadata_bytes(&mut self) -> &[u8] {
+        match self.metadata_buffer {
+            None => self.serialize_metadata(),
+            Some(_) => (),
+        }
+
+        let buffer = match &self.metadata_buffer {
+            None => return &[],
+            Some(x) => return &x,
+        };
     }
 }
 
