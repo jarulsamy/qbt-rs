@@ -141,6 +141,9 @@ impl<'a> Qfs<'a> {
 
     pub fn reload(&mut self) -> Result<(), Error> {
         self.arena = Arena::new();
+        self.inodes = InodeAllocator {
+            next: ROOT_INODE_NUMBER + 1,
+        };
 
         let root = self.arena.new_node(Node {
             kind: NodeKind::Directory {
@@ -151,16 +154,14 @@ impl<'a> Qfs<'a> {
         let mut inode_map = HashMap::new();
         inode_map.insert(ROOT_INODE_NUMBER, root);
 
-        self.inodes = InodeAllocator {
-            next: ROOT_INODE_NUMBER + 1,
-        };
+        let by_name_dir = self.mkdir(Utf8PathBuf::from("/by_name/"))?;
 
         let mut torrent_list = vec![];
         self.client.get_torrent_list(&mut torrent_list)?;
         for torrent in torrent_list.iter() {
             let name = torrent.info.name.clone();
-            let path = Utf8PathBuf::from(name);
-            self.mkdir(path);
+            let path: Utf8PathBuf = ["by_name", &name].iter().collect();
+            self.mkdir(path)?;
         }
 
         Ok(())
@@ -208,10 +209,14 @@ impl<'a> Qfs<'a> {
         });
 
         parent.append(node, &mut self.arena);
+        self.inode_map.insert(inode, node);
 
-        if let NodeKind::Directory { entries } = &mut self.arena[parent].get_mut().kind {
-            entries.insert(name.to_string(), node);
-        }
+        match &mut self.arena[parent].get_mut().kind {
+            NodeKind::Directory { entries } => {
+                entries.insert(name.to_string(), node);
+            }
+            NodeKind::File { .. } => {}
+        };
 
         Ok(node)
     }
