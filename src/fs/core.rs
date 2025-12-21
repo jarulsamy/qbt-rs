@@ -1,20 +1,23 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context, Error, Result};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     ReplyOpen, Request,
 };
 
 use fuser::consts::FOPEN_DIRECT_IO;
+use indextree::{Arena, NodeId};
 use libc::ENOENT;
 use reqwest::{
     self,
     header::{self, HeaderMap},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::{ffi::OsStr, time::SystemTime};
 
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::fs::QfsError;
 use crate::qbt::core::Client;
 use crate::qbt::torrents::Item;
 use crate::qbt::torrents::Torrent;
@@ -22,6 +25,7 @@ use log::{debug, error, info, warn};
 
 use std::result;
 
+use camino::{Utf8Path, Utf8PathBuf};
 use strum::{FromRepr, IntoEnumIterator};
 use strum_macros::EnumIter;
 
@@ -29,225 +33,249 @@ const TTL: Duration = Duration::from_secs(1);
 const BLOCK_SIZE: u32 = 512;
 const INODE_START: usize = 128;
 
-#[derive(Debug, Clone, Copy)]
-enum InodeKind {
-    File,
-    Directory,
+pub type Inode = u64;
+
+const ROOT_INODE_NUMBER: Inode = 1;
+
+#[derive(Debug, Default)]
+pub struct InodeAllocator {
+    next: Inode,
 }
 
-#[derive(Debug, Clone)]
-pub struct Inode<'a> {
-    number: u64,
-    kind: InodeKind,
-
-    pub name: String,
-    pub torrent: Option<&'a Torrent<'a>>,
-    pub item: Option<Item<'a>>,
-}
-
-impl From<InodeKind> for FileType {
-    fn from(item: InodeKind) -> Self {
-        match item {
-            InodeKind::File => Self::RegularFile,
-            InodeKind::Directory => Self::Directory,
-        }
+impl InodeAllocator {
+    pub fn alloc(&mut self) -> Inode {
+        let ino = self.next;
+        self.next += 1;
+        ino
     }
 }
 
-const ROOT_INODE_NUMBER: u64 = 1;
-const INODE_OFFSET: usize = 100_000;
-
-pub struct QFS<'a> {
-    client: &'a Client,
-    torrents: Vec<Torrent<'a>>,
+#[derive(Debug)]
+pub enum NodeKind {
+    Directory { entries: HashMap<String, NodeId> },
+    File { size: u64 },
 }
 
-#[derive(Debug, EnumIter, Copy, Clone, PartialEq, Eq, FromRepr)]
-#[repr(usize)]
-enum FileEntry {
-    Metadata = 1,
-    ContentInfo,
-    Control,
+#[derive(Debug)]
+pub struct Node {
+    pub inode: Inode,
+    pub kind: NodeKind,
 }
 
-impl Into<&'static str> for FileEntry {
-    fn into(self) -> &'static str {
-        match self {
-            Self::Metadata => "metadata",
-            Self::ContentInfo => "content_info",
-            Self::Control => "control",
-        }
+#[derive(Debug)]
+pub struct Qfs<'a> {
+    pub inodes: InodeAllocator,
+    pub inode_map: HashMap<Inode, NodeId>,
+    pub client: &'a Client,
+    pub arena: Arena<Node>,
+    pub root: NodeId,
+    // torrents: Vec<Torrent<'a>>,
+}
+
+fn filetype(node: &Node) -> fuser::FileType {
+    return match node.kind {
+        NodeKind::Directory { .. } => FileType::Directory,
+        NodeKind::File { .. } => FileType::RegularFile,
+    };
+}
+
+fn default_file_attr(node: &Node) -> FileAttr {
+    let kind = filetype(node);
+    let size = match node.kind {
+        NodeKind::File { size } => size,
+        _ => 0,
+    };
+
+    FileAttr {
+        ino: node.inode,
+        size,
+        blocks: 1,
+        atime: SystemTime::now(),
+        mtime: SystemTime::now(),
+        ctime: SystemTime::now(),
+        crtime: SystemTime::now(),
+        kind,
+        perm: match kind {
+            FileType::Directory => 0o755,
+            FileType::RegularFile => 0o644,
+            FileType::Symlink => 0o777,
+            _ => 0o644,
+        },
+        nlink: match kind {
+            FileType::Directory => 2, // minimum for "." + ".."
+            _ => 1,
+        },
+        uid: 1000,
+        gid: 1000,
+        rdev: 0,
+        flags: 0,
+        blksize: 512,
     }
 }
 
-impl TryFrom<&str> for FileEntry {
-    type Error = ();
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "metadata" => Ok(Self::Metadata),
-            "content_info" => Ok(Self::ContentInfo),
-            "control" => Ok(Self::Control),
-            _ => Err(()),
-        }
-    }
-}
-
-impl<'a> QFS<'a> {
-    pub fn reload(&mut self) -> Result<()> {
-        self.client.get_torrent_list(&mut self.torrents);
-        Ok(())
-    }
-
+impl<'a> Qfs<'a> {
     pub fn new(client: &'a Client) -> Result<Self> {
-        let root_inode = Inode {
-            number: ROOT_INODE_NUMBER,
-            kind: InodeKind::Directory,
-            name: "/".to_string(),
-            torrent: None,
-            item: None,
-        };
-        let mut me = Self {
-            client,
-            torrents: vec![],
-        };
+        let mut arena = Arena::new();
 
-        let torrents: Vec<Torrent<'a>> = vec![];
+        let root = arena.new_node(Node {
+            kind: NodeKind::Directory {
+                entries: HashMap::new(),
+            },
+            inode: ROOT_INODE_NUMBER,
+        });
+        let mut inode_map = HashMap::new();
+        inode_map.insert(ROOT_INODE_NUMBER, root);
+
+        let mut me = Self {
+            inodes: InodeAllocator {
+                next: ROOT_INODE_NUMBER + 1,
+            },
+            inode_map: inode_map,
+            client: client,
+            arena: arena,
+            root: root,
+        };
 
         Ok(me)
     }
-}
 
-impl<'a> Filesystem for QFS<'a> {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        info!("LOOKUP  PARENT: {:?}  NAME: {:?}", parent, name);
+    pub fn reload(&mut self) -> Result<(), Error> {
+        self.arena = Arena::new();
 
-        if parent == ROOT_INODE_NUMBER {
-            for (i, t) in self.torrents.iter().enumerate() {
-                if *name != *t.info.name {
-                    continue;
-                }
+        let root = self.arena.new_node(Node {
+            kind: NodeKind::Directory {
+                entries: HashMap::new(),
+            },
+            inode: ROOT_INODE_NUMBER,
+        });
+        let mut inode_map = HashMap::new();
+        inode_map.insert(ROOT_INODE_NUMBER, root);
 
-                let ino = (i + 1) * INODE_OFFSET;
-                let timestamp = t.fetch_time;
-                let my_attr = FileAttr {
-                    ino: ino as u64,
-                    size: 0,
-                    blocks: 0,
-                    atime: timestamp,
-                    mtime: timestamp,
-                    ctime: timestamp,
-                    crtime: timestamp,
-                    kind: FileType::Directory,
-                    perm: 0o755,
-                    nlink: 1,
-                    uid: 1000,
-                    gid: 1000,
-                    rdev: 0,
-                    flags: 0,
-                    blksize: BLOCK_SIZE,
-                };
-                reply.entry(&TTL, &my_attr, 0);
-                return;
-            }
-            reply.error(ENOENT);
-            return;
-        }
-
-        let Some(name_str) = name.to_str() else {
-            reply.error(ENOENT);
-            return;
+        self.inodes = InodeAllocator {
+            next: ROOT_INODE_NUMBER + 1,
         };
 
-        let clean = match FileEntry::try_from(name_str) {
-            Ok(x) => x,
-            Err(_) => {
+        let mut torrent_list = vec![];
+        self.client.get_torrent_list(&mut torrent_list)?;
+        for torrent in torrent_list.iter() {
+            let name = torrent.info.name.clone();
+            let path = Utf8PathBuf::from(name);
+            self.mkdir(path);
+        }
+
+        Ok(())
+    }
+
+    fn resolve(&self, path: &Utf8Path) -> Option<NodeId> {
+        let mut cur = self.root;
+        if path.as_str() == "/" {
+            return Some(cur);
+        }
+
+        for comp in path.components() {
+            let name = comp.as_str();
+            let node = self.arena.get(cur)?;
+            match &node.get().kind {
+                NodeKind::Directory { entries } => {
+                    cur = *entries.get(name)?;
+                }
+                _ => return None,
+            }
+        }
+
+        Some(cur)
+    }
+
+    fn mkdir(&mut self, path: Utf8PathBuf) -> Result<NodeId, QfsError> {
+        let parent_path = path.parent().ok_or(QfsError::InvalidPath)?;
+        let name = path.file_name().ok_or(QfsError::InvalidPath)?;
+        let parent = self.resolve(parent_path).ok_or(QfsError::NotFound)?;
+        match &self.arena[parent].get().kind {
+            NodeKind::Directory { .. } => {}
+            _ => return Err(QfsError::NotDirectory),
+        }
+
+        if self.resolve(&path).is_some() {
+            return Err(QfsError::AlreadyExists);
+        }
+
+        let inode = self.inodes.alloc();
+        let node = self.arena.new_node(Node {
+            inode: inode,
+            kind: NodeKind::Directory {
+                entries: HashMap::new(),
+            },
+        });
+
+        parent.append(node, &mut self.arena);
+
+        if let NodeKind::Directory { entries } = &mut self.arena[parent].get_mut().kind {
+            entries.insert(name.to_string(), node);
+        }
+
+        Ok(node)
+    }
+}
+
+impl<'a> Filesystem for Qfs<'a> {
+    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        info!("LOOKUP: {parent:?}, {name:?}");
+        let ttl = Duration::new(1, 0);
+
+        let parent_id = match self.inode_map.get(&parent) {
+            Some(&nid) => nid,
+            None => {
                 reply.error(ENOENT);
                 return;
             }
         };
 
-        let now = SystemTime::now();
-        let torrents_index = (parent as usize / INODE_OFFSET) - 1;
-        let ino = parent as usize + (clean as usize);
-        if torrents_index > self.torrents.len() {
-            // This should never happen, we're trying to query an inode that
-            // doesn't exist.
-            debug!(
-                "    torrents_index: {:?} / {:?}",
-                torrents_index,
-                self.torrents.len()
-            );
-            reply.error(ENOENT);
-            return;
-        }
-        let torrent = &mut self.torrents[torrents_index];
+        let parent_node = &self.arena[parent_id].get();
 
-        let mut my_attr = FileAttr {
-            ino: ino as u64,
-            size: torrent.get_metadata_len() as u64,
-            blocks: 0,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
-            kind: FileType::RegularFile,
-            perm: 0o600,
-            nlink: 1,
-            uid: 1000,
-            gid: 1000,
-            rdev: 0,
-            flags: 0,
-            blksize: BLOCK_SIZE,
+        let entries = match &parent_node.kind {
+            NodeKind::Directory { entries } => entries,
+            _ => {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
-        reply.entry(&TTL, &my_attr, 0);
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        let child_id = match entries.get(name_str) {
+            Some(&nid) => nid,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        let child = &self.arena[child_id].get();
+
+        reply.entry(&ttl, &default_file_attr(child), 0);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        if ino == ROOT_INODE_NUMBER {
-            const ROOT_ATTR: FileAttr = FileAttr {
-                ino: ROOT_INODE_NUMBER,
-                size: 0,
-                blocks: 0,
-                atime: UNIX_EPOCH,
-                mtime: UNIX_EPOCH,
-                ctime: UNIX_EPOCH,
-                crtime: UNIX_EPOCH,
-                kind: FileType::Directory,
-                perm: 0o755,
-                nlink: 2,
-                uid: 1000,
-                gid: 1000,
-                rdev: 0,
-                flags: 0,
-                blksize: BLOCK_SIZE,
-            };
+        info!("GETATTR: {ino:?}");
+        let ttl = Duration::new(1, 0);
 
-            reply.attr(&TTL, &ROOT_ATTR);
-            return;
-        }
-
-        let my_attr = FileAttr {
-            ino,
-            size: 0,
-            blocks: 0,
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
-            kind: FileType::RegularFile,
-            perm: 0o644,
-            nlink: 2,
-            uid: 1000,
-            gid: 1000,
-            rdev: 0,
-            flags: 0,
-            blksize: BLOCK_SIZE,
+        let node_id = match self.inode_map.get(&ino) {
+            Some(&nid) => nid,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
-        reply.attr(&TTL, &my_attr);
-        return;
+        let node = &self.arena[node_id].get();
+
+        reply.attr(&ttl, &default_file_attr(node));
     }
 
     fn read(
@@ -261,32 +289,7 @@ impl<'a> Filesystem for QFS<'a> {
         lock: Option<u64>,
         reply: ReplyData,
     ) {
-        let torrents_index = (ino as usize / INODE_OFFSET) - 1;
-        let rem = ino as usize % INODE_OFFSET;
-        info!(
-            "============= INO: {:?} IDX: {:?} REM: {:?}",
-            ino, torrents_index, rem
-        );
-        let special_file = match FileEntry::from_repr(rem) {
-            Some(FileEntry::Metadata) => {}
-            _ => return,
-        };
-
-        if torrents_index > self.torrents.len() {
-            // This should never happen, we're trying to query an inode that
-            // doesn't exist.
-            debug!(
-                "    torrents_index: {:?} / {:?}",
-                torrents_index,
-                self.torrents.len()
-            );
-            reply.error(ENOENT);
-            return;
-        }
-        let torrent = &mut self.torrents[torrents_index];
-
-        // let buffer = "Foobarbaz\n".as_bytes();
-        reply.data(torrent.get_metadata_bytes());
+        info!("READ: {ino:?}");
     }
 
     fn readdir(
@@ -297,74 +300,60 @@ impl<'a> Filesystem for QFS<'a> {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let base_entries = vec![
-            (2, FileType::Directory, "."),
-            (3, FileType::Directory, ".."),
-        ];
+        info!("READDIR: {ino:?}, {offset:?}");
 
-        if offset == 0 {
-            for (i, t) in base_entries.iter().enumerate() {
-                reply.add(t.0, (i + 1) as i64, t.1, t.2);
-            }
-        }
-
-        if ino == ROOT_INODE_NUMBER {
-            // Each torrent is represented as a subdirectory, regardless of how
-            // the actual data is layed out within the torrent. This is a
-            // necessary abstraction, since QBT doesn't expose a cheap way to
-            // determine if a torrent is a single file or many directories.
-
-            for (i, t) in self.torrents.iter().enumerate().skip(offset as usize) {
-                // Assume the inode for a torrent is it's index * 100_000.
-                // This limits each torrent to have 100_000 items, but greatly
-                // simplifies the unique inode handling logic, as we can just
-                // increment past the inode for all contents.  This does have
-                // the implication that a single torrent cannot contain more
-                // than 100_000 items within it.
-
-                // Reserve the first INODE_OFFSET inodes
-                let idx = i + 1;
-
-                let my_ino = idx * INODE_OFFSET;
-                // println!("  INODE: {:?}", ino);
-
-                let full = reply.add(
-                    my_ino as u64,
-                    idx as i64,
-                    FileType::Directory,
-                    t.info.name.clone(),
-                );
-                let full = false;
-                if full {
-                    break;
-                }
-            }
-
-            reply.ok();
-            return;
-        }
-
-        // Calculate the position within the torrents vector.
-        let torrents_index = ((ino - 1) as usize) / INODE_OFFSET;
-        if torrents_index > self.torrents.len() {
-            // This should never happen, we're trying to query an inode that
-            // doesn't exist.
+        let Some(&dir_id) = self.inode_map.get(&ino) else {
             reply.error(ENOENT);
             return;
-        }
-        let torrent = &self.torrents[torrents_index];
+        };
 
-        for (i, f) in FileEntry::iter().enumerate().skip(offset as usize) {
-            let fname: &str = f.into();
-            let ino = ino + 1;
-            let idx = torrents_index + 1;
-            let full = reply.add(ino as u64, (i + 1) as i64, FileType::RegularFile, fname);
-            if (full) {
-                let name = &torrent.info.name;
-                warn!("Full on returning magic files for torrent {name}");
-                break;
+        let dir_node = &self.arena[dir_id];
+        let NodeKind::Directory { entries } = &dir_node.get().kind else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        // FUSE offset protocol:
+        // offset == 0 → start
+        // offset > 0 → resume after that index
+        let mut index: i64 = 0;
+
+        if offset <= index {
+            if reply.add(ino, index + 1, FileType::Directory, ".") {
+                reply.ok();
+                return;
             }
         }
+        index += 1;
+
+        let parent_ino = dir_node
+            .parent()
+            .map(|p| self.arena[p].get().inode)
+            .unwrap_or(ino);
+
+        if offset <= index {
+            if reply.add(parent_ino, index + 1, FileType::Directory, "..") {
+                reply.ok();
+                return;
+            }
+        }
+        index += 1;
+
+        // 3️⃣ Directory entries
+        for (name, &child_id) in entries {
+            let child = &self.arena[child_id].get();
+            let child_ino = child.inode;
+            let kind = filetype(&child);
+
+            if offset <= index {
+                if reply.add(child_ino, index + 1, kind, name) {
+                    reply.ok();
+                    return;
+                }
+            }
+            index += 1;
+        }
+
         reply.ok();
     }
 }

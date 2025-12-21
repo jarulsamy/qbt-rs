@@ -1,4 +1,4 @@
-use qbt_rs::fs::core::QFS;
+use qbt_rs::fs::core::Qfs;
 // mod qbt;
 use anyhow::{bail, Context, Result};
 use qbt_rs::fs;
@@ -11,6 +11,7 @@ use fuser::{
     Request,
 };
 use libc::ENOENT;
+use log::LevelFilter;
 use std::ffi::OsStr;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -69,7 +70,7 @@ fn qbt_test() {
 }
 
 fn fuse_test() -> Result<()> {
-    let mountpoint = "/home/joshua/repos/qbt-rs/mount";
+    let mountpoint = "/home/joshua/git/qbt-rs/mount";
 
     let base_url = "REDACTED";
     let username = "REDACTED";
@@ -77,9 +78,9 @@ fn fuse_test() -> Result<()> {
 
     let mut qbt = qbt::core::Client::new(base_url, username, password, false).unwrap();
 
-    let options = vec![MountOption::RO, MountOption::FSName("QFS".to_string())];
-    let mut fs = QFS::new(&qbt)?;
-    fs.reload()?;
+    let options = vec![MountOption::RO, MountOption::FSName("Qfs".to_string())];
+    let mut fs = Qfs::new(&qbt)?;
+    fs.reload();
     fuser::mount2(fs, mountpoint, &options).unwrap();
 
     Ok(())
