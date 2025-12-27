@@ -53,7 +53,7 @@ impl InodeAllocator {
 #[derive(Debug)]
 pub enum NodeKind {
     Directory { entries: HashMap<String, NodeId> },
-    File { size: u64 },
+    File { contents: Box<[u8]> },
 }
 
 #[derive(Debug)]
@@ -81,14 +81,14 @@ fn filetype(node: &Node) -> fuser::FileType {
 
 fn default_file_attr(node: &Node) -> FileAttr {
     let kind = filetype(node);
-    let size = match node.kind {
-        NodeKind::File { size } => size,
+    let size = match &node.kind {
+        NodeKind::File { contents, .. } => contents.len(),
         _ => 0,
     };
 
     FileAttr {
         ino: node.inode,
-        size,
+        size: size.try_into().unwrap_or(0),
         blocks: 1,
         atime: SystemTime::now(),
         mtime: SystemTime::now(),
@@ -161,7 +161,16 @@ impl<'a> Qfs<'a> {
         for torrent in torrent_list.iter() {
             let name = torrent.info.name.clone();
             let path: Utf8PathBuf = ["by_name", &name].iter().collect();
-            self.mkdir(path)?;
+            match self.mkdir(path.clone()) {
+                Err(e) => {
+                    error!("Failed to mkdir: {}: {}", path, e);
+                    continue;
+                }
+                Ok(..) => {
+                    let metadata_path = path.join("metadata");
+                    let res = self.write(metadata_path, "This is a test buffer\n".as_bytes())?;
+                }
+            }
         }
 
         Ok(())
@@ -219,6 +228,48 @@ impl<'a> Qfs<'a> {
         };
 
         Ok(node)
+    }
+
+    fn write(&mut self, path: Utf8PathBuf, buf: &[u8]) -> Result<NodeId, QfsError> {
+        let parent_path = path.parent().ok_or(QfsError::InvalidPath)?;
+        let name = path.file_name().ok_or(QfsError::InvalidPath)?;
+        let parent = self.resolve(parent_path).ok_or(QfsError::NotFound)?;
+        match &self.arena[parent].get().kind {
+            NodeKind::Directory { .. } => {}
+            _ => return Err(QfsError::NotDirectory),
+        }
+
+        let n = buf.len();
+
+        match self.resolve(&path) {
+            Some(x) => {
+                match self.arena[x].get_mut().kind {
+                    NodeKind::File { ref mut contents } => {
+                        *contents = buf[..n].into();
+                        return Ok(x);
+                    }
+                    _ => return Err(QfsError::NotFile),
+                };
+            }
+            None => {
+                let inode_num = self.inodes.alloc();
+                let contents: Box<[u8]> = buf[..n].into();
+                let node = self.arena.new_node(Node {
+                    inode: inode_num,
+                    kind: NodeKind::File { contents: contents },
+                });
+                parent.append(node, &mut self.arena);
+                match &mut self.arena[parent].get_mut().kind {
+                    NodeKind::Directory { entries } => {
+                        entries.insert(name.to_string(), node);
+                    }
+                    NodeKind::File { .. } => {}
+                };
+
+                self.inode_map.insert(inode_num, node);
+                return Ok(node);
+            }
+        };
     }
 }
 
@@ -294,7 +345,31 @@ impl<'a> Filesystem for Qfs<'a> {
         lock: Option<u64>,
         reply: ReplyData,
     ) {
-        info!("READ: {ino:?}");
+        let Some(&node_id) = self.inode_map.get(&ino) else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        let node = self.arena[node_id].get();
+
+        let contents = match &node.kind {
+            NodeKind::File { contents } => contents,
+            _ => {
+                reply.error(libc::EISDIR);
+                return;
+            }
+        };
+
+        let offset = offset as usize;
+        if offset >= contents.len() {
+            // reading past EOF
+            reply.data(&[]);
+            return;
+        }
+
+        let end = (offset + contents.len()).min(contents.len());
+        let data = &contents[offset..end];
+        reply.data(data);
     }
 
     fn readdir(

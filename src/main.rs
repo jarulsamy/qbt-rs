@@ -80,7 +80,7 @@ fn fuse_test() -> Result<()> {
 
     let options = vec![MountOption::RO, MountOption::FSName("Qfs".to_string())];
     let mut fs = Qfs::new(&qbt)?;
-    fs.reload();
+    fs.reload()?;
     fuser::mount2(fs, mountpoint, &options).unwrap();
 
     Ok(())
@@ -102,5 +102,5 @@ fn main() {
 
     // shell().unwrap();
 
-    fuse_test();
+    fuse_test().unwrap();
 }
