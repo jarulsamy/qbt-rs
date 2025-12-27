@@ -24,3 +24,6 @@ strum_macros = "0.27.1"
 [lints.rust]
 unused = "allow"
 unsafe_code = "forbid"
+
+[dev-dependencies]
+flamegraph = "0.6.10"
