@@ -158,7 +158,7 @@ impl<'a> Qfs<'a> {
 
         let mut torrent_list = vec![];
         self.client.get_torrent_list(&mut torrent_list)?;
-        for torrent in torrent_list.iter() {
+        for torrent in torrent_list.iter_mut() {
             let name = torrent.info.name.clone();
             let path: Utf8PathBuf = ["by_name", &name].iter().collect();
             match self.mkdir(path.clone()) {
@@ -168,7 +168,7 @@ impl<'a> Qfs<'a> {
                 }
                 Ok(..) => {
                     let metadata_path = path.join("metadata");
-                    let res = self.write(metadata_path, "This is a test buffer\n".as_bytes())?;
+                    let res = self.write(metadata_path, torrent.get_metadata_bytes());
                 }
             }
         }
